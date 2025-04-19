@@ -6,13 +6,18 @@ from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
 from langchain.callbacks import get_openai_callback
 
+from langchain.document_loaders import PyPDFLoader
+from langchain_core.pydantic_v1 import BaseModel, Field
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
+import re
 import sys
+import time
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+#from langchain_openai import ChatOpenAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from typing import List, Tuple, Dict
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
@@ -24,28 +29,37 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 
 from spacy.cli import download
 from spacy.lang.en import English
 
 sys.path.append(os.path.abspath(
     os.path.join(os.getcwd(), '..')))  # Add the parent directory to the path sicnce we work with notebooks
-from helper_functions import *
-from evaluation.evalute_rag import *
+#from helper_functions import *
+#from evaluation.evalute_rag import *
 
 # Load environment variables from a .env file
 load_dotenv()
 
 # Set the OpenAI API key environment variable
-os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+#os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+import google.generativeai as genai
+genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 nltk.download('punkt', quiet=True)
 nltk.download('wordnet', quiet=True)
 
 
+N_RETRIES = 4
 # Define the document processor class
 # Define the DocumentProcessor class
+
+class ResourceExhausted(Exception):
+    pass
+
+
 class DocumentProcessor:
     def __init__(self):
         """
@@ -56,7 +70,7 @@ class DocumentProcessor:
         - embeddings: An instance of OpenAIEmbeddings used for embedding documents.
         """
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        self.embeddings = OpenAIEmbeddings()
+        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 
     def process_documents(self, documents):
         """
@@ -70,8 +84,17 @@ class DocumentProcessor:
           - splits (list of str): The list of split document chunks.
           - vector_store (FAISS): A FAISS vector store created from the split document chunks and their embeddings.
         """
+        print("Start splitting:")
         splits = self.text_splitter.split_documents(documents)
-        vector_store = FAISS.from_documents(splits, self.embeddings)
+        texts = [split.page_content for split in splits]
+        result = genai.embed_content(model="models/text-embedding-004",content=texts)
+    
+        embeddings =  result["embedding"]
+        text_embeddings = zip(texts, embeddings)
+        print("###########Start creating Vectorstore##########")
+        vector_store = FAISS.from_embeddings(text_embeddings, self.embeddings)
+        # vector_store = FAISS.from_documents(splits, self.embeddings)
+        print("###########Created Vectorstore##########")
         return splits, vector_store
 
     def create_embeddings_batch(self, texts, batch_size=32):
@@ -88,7 +111,14 @@ class DocumentProcessor:
         embeddings = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            batch_embeddings = self.embeddings.embed_documents(batch)
+            for tries in range(N_RETRIES):  
+                try:
+                    print(f"try No. (in create embeddings batch) {tries}")
+                    batch_embeddings = self.embeddings.embed_documents(batch) 
+                    return batch_embeddings
+                except ResourceExhausted as e:
+                    time.sleep(15)
+            #batch_embeddings = self.embeddings.embed_documents(batch)
             embeddings.extend(batch_embeddings)
         return np.array(embeddings)
 
@@ -172,7 +202,13 @@ class KnowledgeGraph:
         - numpy.ndarray: An array of embeddings for the document splits.
         """
         texts = [split.page_content for split in splits]
-        return embedding_model.embed_documents(texts)
+        for att in range(N_RETRIES):  
+                try: 
+                    return embedding_model.embed_documents(texts)
+                except ResourceExhausted as e:
+                    print(f"attempting try no. (in _create_embeddings) {att}")
+                    time.sleep(15)
+        #return embedding_model.embed_documents(texts)
 
     def _compute_similarities(self, embeddings):
         """
@@ -227,7 +263,17 @@ class KnowledgeGraph:
             template="Extract key concepts (excluding named entities) from the following text:\n\n{text}\n\nKey concepts:"
         )
         concept_chain = concept_extraction_prompt | llm.with_structured_output(Concepts)
-        general_concepts = concept_chain.invoke({"text": content}).concepts_list
+        # for tries in range(N_RETRIES):  
+        #             try:
+        #                 print(f"try No. (in concept chain): {tries}")
+        concept_chain_invoke = concept_chain.invoke({"text": content})
+        if concept_chain_invoke:
+            general_concepts = concept_chain_invoke.concepts_list
+        else:
+            general_concepts = []
+                    # except ResourceExhausted as e:
+                    #     time.sleep(30)
+        #general_concepts = concept_chain.invoke({"text": content}).concepts_list
 
         # Combine named entities and general concepts
         all_concepts = list(set(named_entities + general_concepts))
@@ -536,33 +582,33 @@ class QueryEngine:
           - traversal_path (list): The traversal path of nodes in the knowledge graph.
           - filtered_content (dict): The filtered content of nodes.
         """
-        with get_openai_callback() as cb:
-            print(f"\nProcessing query: {query}")
-            relevant_docs = self._retrieve_relevant_documents(query)
-            expanded_context, traversal_path, filtered_content, final_answer = self._expand_context(query,
-                                                                                                    relevant_docs)
+        # with get_openai_callback() as cb:
+        print(f"\nProcessing query: {query}")
+        relevant_docs = self._retrieve_relevant_documents(query)
+        expanded_context, traversal_path, filtered_content, final_answer = self._expand_context(query,
+                                                                                                relevant_docs)
 
-            if not final_answer:
-                print("\nGenerating final answer...")
-                response_prompt = PromptTemplate(
-                    input_variables=["query", "context"],
-                    template="Based on the following context, please answer the query.\n\nContext: {context}\n\nQuery: {query}\n\nAnswer:"
-                )
+        if not final_answer:
+            print("\nGenerating final answer...")
+            response_prompt = PromptTemplate(
+                input_variables=["query", "context"],
+                template="Based on the following context, please answer the query.\n\nContext: {context}\n\nQuery: {query}\n\nAnswer:"
+            )
 
-                response_chain = response_prompt | self.llm
-                input_data = {"query": query, "context": expanded_context}
-                response = response_chain.invoke(input_data)
-                final_answer = response
-            else:
-                print("\nComplete answer found during traversal.")
+            response_chain = response_prompt | self.llm
+            input_data = {"query": query, "context": expanded_context}
+            response = response_chain.invoke(input_data)
+            final_answer = response
+        else:
+            print("\nComplete answer found during traversal.")
 
-            print(f"\nFinal Answer: {final_answer}")
-            print(f"\nTotal Tokens: {cb.total_tokens}")
-            print(f"Prompt Tokens: {cb.prompt_tokens}")
-            print(f"Completion Tokens: {cb.completion_tokens}")
-            print(f"Total Cost (USD): ${cb.total_cost}")
+        print(f"\nFinal Answer: {final_answer}")
+        # print(f"\nTotal Tokens: {cb.total_tokens}")
+        # print(f"Prompt Tokens: {cb.prompt_tokens}")
+        # print(f"Completion Tokens: {cb.completion_tokens}")
+        # print(f"Total Cost (USD): ${cb.total_cost}")
 
-        return final_answer, traversal_path, filtered_content
+        return final_answer, traversal_path, filtered_content, relevant_docs
 
     def _retrieve_relevant_documents(self, query: str):
         """
@@ -576,9 +622,9 @@ class QueryEngine:
         """
         print("\nRetrieving relevant documents...")
         retriever = self.vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-        compressor = LLMChainExtractor.from_llm(self.llm)
-        compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever)
-        return compression_retriever.invoke(query)
+        # compressor = LLMChainExtractor.from_llm(self.llm)
+        # compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever)
+        return retriever.invoke(query)
 
 
 # Import necessary libraries
@@ -707,6 +753,7 @@ class Visualizer:
 
         plt.tight_layout()
         plt.show()
+        plt.savefig("traversal.png")
 
     @staticmethod
     def print_filtered_content(traversal_path, filtered_content):
@@ -746,8 +793,8 @@ class GraphRAG:
         - query_engine: An instance of the QueryEngine class for handling queries (initialized as None).
         - visualizer: An instance of the Visualizer class for visualizing the knowledge graph traversal.
         """
-        self.llm = ChatOpenAI(temperature=0, model_name="gpt-4o-mini", max_tokens=4000)
-        self.embedding_model = OpenAIEmbeddings()
+        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.01, max_tokens=2048)
+        self.embedding_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
         self.document_processor = DocumentProcessor()
         self.knowledge_graph = KnowledgeGraph()
         self.query_engine = None
@@ -778,10 +825,11 @@ class GraphRAG:
         Returns:
         - str: The response to the query.
         """
-        response, traversal_path, filtered_content = self.query_engine.query(query)
+        response, traversal_path, filtered_content, retrieved_documents = self.query_engine.query(query)
 
         if traversal_path:
-            self.visualizer.visualize_traversal(self.knowledge_graph.graph, traversal_path)
+            print("traversal path available but skipping")
+            #self.visualizer.visualize_traversal(self.knowledge_graph.graph, traversal_path)
         else:
             print("No traversal path to visualize.")
 
@@ -797,20 +845,117 @@ def parse_args():
                         help='Query to retrieve documents.')
     return parser.parse_args()
 
+def get_company_names(path):
+    companies = []
+    for filename in os.listdir(path):
+        company_name = filename.split("_")[0]
+        companies.append(company_name)
+    final_companies = [company.upper() for company in companies]
+    return set(final_companies)
+
+def label_questions(company_list, df_questions):
+    df_questions_with_comps = df_questions.copy()
+    company_list.update(["AMEX", "JNJ", "JPM", "MGM"]) #hardcoded based on data
+    company_list.remove("MGMRESORTS")
+    company_labels = []
+    for question in df_questions["question"]:
+        question_unspaced = question.replace(" ", "")
+        for company in company_list:
+            if re.search(company, question_unspaced, re.IGNORECASE):
+                company_labels.append(company)
+            else:
+                continue
+    
+    df_questions_with_comps["company_name"] = company_labels
+    df_questions_with_comps["company_name"] = df_questions_with_comps["company_name"].replace({"AMEX":"AMERICANEXPRESS", "JNJ":"JOHNSON", "JPM":"JPMORGAN", "MGM":"MGMRESORTS"})
+    return df_questions_with_comps, set(df_questions_with_comps["company_name"])
+
+
 
 if __name__ == '__main__':
+    PATH_CURRENT = os.path.abspath(os.getcwd())
+    # PATH_DATASET_JSONL = PATH_CURRENT + "/../data/financebench_open_source.jsonl"
+    # PATH_DOCUMENT_INFO_JSONL = PATH_CURRENT + "/../data/financebench_document_information.jsonl"
+    # PATH_RESULTS = PATH_CURRENT + "/results/"
+    # PATH_PDFS = PATH_CURRENT + "/../data/pdfs/"
+
+    PATH_DATASET_JSONL = PATH_CURRENT + "/data/financebench_open_source.jsonl"
+    PATH_DOCUMENT_INFO_JSONL = PATH_CURRENT + "/data/financebench_document_information.jsonl"
+    PATH_RESULTS = PATH_CURRENT + "/results/"
+    PATH_PDFS = PATH_CURRENT + "/data/pdfs/"
+
+    names = get_company_names(PATH_PDFS)
+
+    print(PATH_CURRENT)
+    print(os.path.exists(PATH_DATASET_JSONL))
+    print(os.path.exists(PATH_DOCUMENT_INFO_JSONL))
+
+    DATASET_PORTION = "OPEN_SOURCE" 
+    df_questions = pd.read_json(PATH_DATASET_JSONL, lines=True)
+    df_questions.to_csv("original_Qs.csv", escapechar="\\")
+    df_questions_comps, company_list = label_questions(names, df_questions)
+    df_questions_comps.to_csv("original_Qs.csv", escapechar="\\")
+    df_meta = pd.read_json(PATH_DOCUMENT_INFO_JSONL, lines=True)
+    df_full = pd.merge(df_questions, df_meta, on="doc_name")
+
+    # Get all docs
+    df_questions = df_questions.sort_values('doc_name')
+    ALL_DOCS = df_questions['doc_name'].unique().tolist()
+    print(f"Total number of distinct PDF: {len(ALL_DOCS)}")
+
+    # Select relevant dataset portion
+    if DATASET_PORTION != "ALL":
+        df_questions = df_questions.loc[df_questions["dataset_subset_label"]==DATASET_PORTION]
+    print(f"Number of questions: {len(df_questions)}")
+
+    # Check relevant documents
+    df_questions = df_questions.sort_values('doc_name')
+    docs = df_questions['doc_name'].unique().tolist()
+    print(f"Number of distinct PDF: {len(docs)}")
+
     args = parse_args()
 
     # Load the documents
-    loader = PyPDFLoader(args.path)
-    documents = loader.load()
-    documents = documents[:10]
+    #loader = PyPDFLoader(args.path)
+    
+    done = ["AMERICANEXPRESS", "MICROSOFT", "FOOTLOCKER", "ULTABEAUTY",
+             "ADOBE", "AMD", "NIKE", "PAYPAL", "BOEING", "CVSHEALTH"]
+    #companies = []
+    #temp = ["PAYPAL"]
+    print(f"Total number  of companies: {len(company_list)}")
+    companies = [company for company in company_list if company not in done]
 
-    # Create a graph RAG instance
-    graph_rag = GraphRAG(documents)
+    for company in companies:
+        results = []
+        documents = []
+        print(f"######### Currently processing {company} #########")
+        for doc in docs:
+            if re.search(company, doc):
+                path = PATH_PDFS + doc + ".pdf"
+                loader = PyPDFLoader(path)
+                documents.extend(loader.load())
+            else:
+                continue        
+        print(len(documents))
 
-    # Process the documents and create the graph
-    graph_rag.process_documents(documents)
+        # Create a graph RAG instance
+        graph_rag = GraphRAG(documents)
 
+        # Process the documents and create the graph
+        #graph_rag.process_documents(documents)
+        
+        #for (idx, row) in df_questions_comps[df_questions_comps["company_name"] == company].iterrows():
+        for k, (idx, row) in tqdm(enumerate(df_questions_comps[df_questions_comps["company_name"] == company].sort_values("doc_name").iterrows()), total=len(df_questions_comps[df_questions_comps["company_name"] == company])):
+            response = graph_rag.query(row["question"])
+            print(f"The answer to the given question {row["question"]} is:\n{response}")
+            results.append({ 
+                                "financebench_id" : row["financebench_id"],
+                                "question" : row["question"],
+                                "gold_answer": row["answer"],
+                                "model_answer": response
+                            })
+        
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(f"graph_rag_{company}.csv", escapechar="\\")
     # Input a query and get the retrieved information from the graph RAG
-    response = graph_rag.query(args.query)
+    #response = graph_rag.query(args.query)
